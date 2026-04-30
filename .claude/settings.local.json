@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install *)",
+      "Bash(node -e \"require\\('recharts'\\); console.log\\('ok'\\)\")",
+      "Bash(npm run *)"
+    ]
+  }
+}
