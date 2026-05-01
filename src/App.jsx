@@ -8,43 +8,6 @@ import {
 const STORAGE_KEY = "glucosa_registros";
 const CONTEXTOS   = ["Ayunas", "Pre-comida", "Post-comida (2h)", "Antes de dormir", "Otro"];
 const TZ          = "America/El_Salvador"; // UTC-6, sin horario de verano
-const FILE_API    = typeof window !== "undefined" && "showOpenFilePicker" in window;
-
-// ── IndexedDB (persiste el file handle entre recargas) ────────────────────────
-const idb = (() => {
-  const open = () =>
-    new Promise((res, rej) => {
-      const r = indexedDB.open("glucosa_idb", 1);
-      r.onupgradeneeded = () => r.result.createObjectStore("kv");
-      r.onsuccess  = () => res(r.result);
-      r.onerror    = () => rej(r.error);
-    });
-  return {
-    get: async (key) => {
-      try {
-        const db = await open();
-        return await new Promise((res) => {
-          const req = db.transaction("kv").objectStore("kv").get(key);
-          req.onsuccess = () => res(req.result ?? null);
-          req.onerror   = () => res(null);
-        });
-      } catch { return null; }
-    },
-    set: async (key, val) => {
-      try {
-        const db = await open();
-        await new Promise((res, rej) => {
-          const tx = db.transaction("kv", "readwrite");
-          val === null
-            ? tx.objectStore("kv").delete(key)
-            : tx.objectStore("kv").put(val, key);
-          tx.oncomplete = res;
-          tx.onerror    = rej;
-        });
-      } catch { /* silent */ }
-    },
-  };
-})();
 
 // ── Helpers de zona horaria y formato ─────────────────────────────────────────
 const getRango = (val) => {
@@ -63,9 +26,9 @@ const parseCST = (iso) =>
 const fmt = (iso) => {
   const d = parseCST(iso);
   return (
-    d.toLocaleDateString("es-SV",  { day: "2-digit", month: "short", timeZone: TZ }) +
+    d.toLocaleDateString("es-SV", { day: "2-digit", month: "short", timeZone: TZ }) +
     " " +
-    d.toLocaleTimeString("es-SV",  { hour: "2-digit", minute: "2-digit", timeZone: TZ })
+    d.toLocaleTimeString("es-SV", { hour: "2-digit", minute: "2-digit", timeZone: TZ })
   );
 };
 
@@ -74,147 +37,32 @@ const fmtShort = (iso) =>
 
 // ── Componente principal ──────────────────────────────────────────────────────
 export default function App() {
-  // Estado de registros y formulario
-  const [registros, setRegistros]     = useState([]);
-  const [valor, setValor]             = useState("");
-  const [ctx, setCtx]                 = useState(CONTEXTOS[0]);
-  const [fecha, setFecha]             = useState(nowCST);
-  const [tab, setTab]                 = useState("registro");
-  const [guardado, setGuardado]       = useState(false);
+  const [registros, setRegistros] = useState([]);
+  const [valor, setValor]         = useState("");
+  const [ctx, setCtx]             = useState(CONTEXTOS[0]);
+  const [fecha, setFecha]         = useState(nowCST);
+  const [tab, setTab]             = useState("registro");
+  const [guardado, setGuardado]   = useState(false);
+  const [importMsg, setImportMsg] = useState(null); // { type: "ok"|"error", text }
 
-  // Estado del archivo vinculado
-  const [fileLinked, setFileLinked]             = useState(false);
-  const [fileName, setFileName]                 = useState("");
-  const [fileNeedsReconnect, setFileNeedsReconnect] = useState(false);
-  const fileHandleRef = useRef(null);
-  const timeoutRef    = useRef(null);
+  const timeoutRef   = useRef(null);
+  const importMsgRef = useRef(null);
+  const fileInputRef = useRef(null);
 
-  // ── Inicialización ───────────────────────────────────────────────────────────
+  // ── Carga inicial desde localStorage ────────────────────────────────────────
   useEffect(() => {
-    const init = async () => {
-      // 1. Cargar desde localStorage como base
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) setRegistros(JSON.parse(saved));
-
-      // 2. Intentar restaurar el file handle desde IndexedDB
-      if (!FILE_API) return;
-      const handle = await idb.get("fileHandle");
-      if (!handle) return;
-
-      fileHandleRef.current = handle;
-      setFileName(handle.name);
-
-      try {
-        const perm = await handle.queryPermission({ mode: "readwrite" });
-        if (perm === "granted") {
-          await leerDesdeArchivo(handle);
-        } else {
-          // El navegador necesita gesto del usuario para re-autorizar
-          setFileNeedsReconnect(true);
-        }
-      } catch {
-        setFileNeedsReconnect(true);
-      }
-    };
-    init();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) {
+      try { setRegistros(JSON.parse(saved)); } catch { /* datos corruptos, ignorar */ }
+    }
   }, []);
 
-  // ── Lectura desde archivo ────────────────────────────────────────────────────
-  const leerDesdeArchivo = async (handle) => {
-    try {
-      const file = await handle.getFile();
-      const text = await file.text();
-      if (text.trim()) {
-        const data = JSON.parse(text);
-        setRegistros(data);
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-      }
-      setFileLinked(true);
-      setFileNeedsReconnect(false);
-    } catch (e) {
-      console.error("Error leyendo archivo:", e);
-    }
-  };
-
-  // ── Escritura en archivo ─────────────────────────────────────────────────────
-  const guardarEnArchivo = async (lista) => {
-    if (!fileHandleRef.current) return;
-    try {
-      const writable = await fileHandleRef.current.createWritable();
-      await writable.write(JSON.stringify(lista, null, 2));
-      await writable.close();
-    } catch { /* silent — localStorage siempre es el fallback */ }
-  };
-
-  // Guarda en localStorage + archivo vinculado (si existe)
+  // ── Persistencia en localStorage ────────────────────────────────────────────
   const guardar = (lista) => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(lista));
-    guardarEnArchivo(lista); // fire-and-forget
   };
 
-  // ── Acciones del archivo ─────────────────────────────────────────────────────
-  const abrirArchivo = async () => {
-    if (!FILE_API) return;
-    try {
-      const [handle] = await window.showOpenFilePicker({
-        types: [{
-          description: "Registros de glucosa (.txt)",
-          accept: { "text/plain": [".txt", ".json"] },
-        }],
-      });
-      fileHandleRef.current = handle;
-      setFileName(handle.name);
-      await idb.set("fileHandle", handle);
-      await leerDesdeArchivo(handle);
-    } catch (e) {
-      if (e.name !== "AbortError") console.error(e);
-    }
-  };
-
-  const crearArchivo = async () => {
-    if (!FILE_API) return;
-    try {
-      const handle = await window.showSaveFilePicker({
-        suggestedName: "glucosa-registros.txt",
-        types: [{
-          description: "Registros de glucosa (.txt)",
-          accept: { "text/plain": [".txt"] },
-        }],
-      });
-      fileHandleRef.current = handle;
-      setFileName(handle.name);
-      setFileLinked(true);
-      setFileNeedsReconnect(false);
-      await idb.set("fileHandle", handle);
-      // Escribir registros actuales en el archivo nuevo
-      const writable = await handle.createWritable();
-      await writable.write(JSON.stringify(registros, null, 2));
-      await writable.close();
-    } catch (e) {
-      if (e.name !== "AbortError") console.error(e);
-    }
-  };
-
-  const reconectarArchivo = async () => {
-    if (!fileHandleRef.current) return;
-    try {
-      const perm = await fileHandleRef.current.requestPermission({ mode: "readwrite" });
-      if (perm === "granted") await leerDesdeArchivo(fileHandleRef.current);
-    } catch (e) {
-      console.error(e);
-    }
-  };
-
-  const desvincularArchivo = async () => {
-    fileHandleRef.current = null;
-    setFileLinked(false);
-    setFileName("");
-    setFileNeedsReconnect(false);
-    await idb.set("fileHandle", null);
-  };
-
-  // ── CRUD de registros ────────────────────────────────────────────────────────
+  // ── CRUD ─────────────────────────────────────────────────────────────────────
   const agregar = () => {
     const v = parseFloat(valor);
     if (!v || v < 20 || v > 600) return;
@@ -235,8 +83,74 @@ export default function App() {
     guardar(lista);
   };
 
+  // ── Exportar como .txt (JSON legible) ────────────────────────────────────────
+  const exportarTxt = () => {
+    if (!registros.length) return;
+    const contenido = JSON.stringify(registros, null, 2);
+    const blob = new Blob([contenido], { type: "text/plain;charset=utf-8" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `glucosa-${new Date().toLocaleDateString("sv-SE", { timeZone: TZ })}.txt`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
+  // ── Exportar como CSV ────────────────────────────────────────────────────────
+  const exportarCsv = () => {
+    if (!registros.length) return;
+    const csv = [
+      "Fecha,Glucosa (mg/dL),Contexto,Rango",
+      ...registros.map(r => `${fmt(r.fecha)},${r.valor},${r.contexto},${getRango(r.valor).label}`),
+    ].join("\n");
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    a.download = `glucosa-${new Date().toLocaleDateString("sv-SE", { timeZone: TZ })}.csv`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
+  // ── Importar desde .txt ──────────────────────────────────────────────────────
+  const mostrarMsgImport = (type, text) => {
+    setImportMsg({ type, text });
+    clearTimeout(importMsgRef.current);
+    importMsgRef.current = setTimeout(() => setImportMsg(null), 4000);
+  };
+
+  const onFileSelected = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const data = JSON.parse(ev.target.result);
+        if (!Array.isArray(data)) throw new Error("formato inválido");
+        // Validar que cada elemento tenga los campos mínimos
+        const validos = data.filter(r => r.id && r.valor != null && r.fecha);
+        if (!validos.length) throw new Error("el archivo no contiene registros válidos");
+        const lista = validos.sort((a, b) => parseCST(b.fecha) - parseCST(a.fecha));
+        setRegistros(lista);
+        guardar(lista);
+        mostrarMsgImport("ok", `${lista.length} registros importados correctamente.`);
+      } catch (err) {
+        mostrarMsgImport("error", `No se pudo importar: ${err.message}.`);
+      }
+    };
+    reader.readAsText(file, "utf-8");
+    // Limpiar el input para permitir reimportar el mismo archivo
+    e.target.value = "";
+  };
+
+  // ── Copiar como texto ────────────────────────────────────────────────────────
+  const copiarTexto = () => {
+    if (!registros.length) return;
+    const txt = registros
+      .map(r => `${fmt(r.fecha)} | ${r.valor} mg/dL | ${r.contexto} | ${getRango(r.valor).label}`)
+      .join("\n");
+    navigator.clipboard.writeText(txt).then(() => alert("¡Copiado al portapapeles!"));
+  };
+
   // ── Datos derivados ──────────────────────────────────────────────────────────
-  const promedio = registros.length
+  const promedio  = registros.length
     ? Math.round(registros.reduce((s, r) => s + r.valor, 0) / registros.length)
     : null;
   const ultima    = registros[0];
@@ -256,6 +170,12 @@ export default function App() {
     cursor: "pointer", transition: "color .15s",
   });
 
+  const ghostBtn = {
+    fontSize: 13, padding: "8px 14px",
+    background: "var(--blue-light)", color: "var(--blue-primary)",
+    border: "1.5px solid var(--color-border-primary)", boxShadow: "none",
+  };
+
   // ── Render ───────────────────────────────────────────────────────────────────
   return (
     <div style={{ fontFamily: "var(--font-sans)" }}>
@@ -264,7 +184,7 @@ export default function App() {
       <div style={{
         background: "linear-gradient(135deg, #1d4ed8 0%, #3b82f6 100%)",
         borderRadius: "var(--border-radius-lg)", padding: "1.25rem 1.5rem",
-        marginBottom: "1rem", color: "#fff",
+        marginBottom: "1.25rem", color: "#fff",
         boxShadow: "0 4px 16px rgba(37,99,235,0.30)",
       }}>
         <div style={{ fontSize: 10, letterSpacing: 3, opacity: 0.75, textTransform: "uppercase", marginBottom: 4 }}>
@@ -275,94 +195,6 @@ export default function App() {
         </div>
         <div style={{ fontSize: 11, opacity: 0.7, marginTop: 4 }}>
           Zona horaria: Centroamérica (UTC-6)
-        </div>
-      </div>
-
-      {/* ── Banner de archivo vinculado ── */}
-      <div style={{
-        marginBottom: "1.25rem",
-        background:
-          fileLinked          ? "#f0fdf4" :
-          fileNeedsReconnect  ? "#fffbeb" : "#f0f7ff",
-        border: `1.5px solid ${
-          fileLinked          ? "#86efac" :
-          fileNeedsReconnect  ? "#fcd34d" : "#bfdbfe"
-        }`,
-        borderRadius: "var(--border-radius-md)",
-        padding: "10px 14px",
-        display: "flex", alignItems: "center",
-        justifyContent: "space-between", gap: 10, flexWrap: "wrap",
-      }}>
-        {/* Texto de estado */}
-        <div style={{ flex: 1, minWidth: 0 }}>
-          {!FILE_API ? (
-            <span style={{ fontSize: 12, color: "#dc2626" }}>
-              ⚠️ Tu navegador no soporta File System API. Usa Chrome o Edge para vincular archivos.
-            </span>
-          ) : fileLinked ? (
-            <div>
-              <div style={{ fontSize: 13, color: "#15803d", fontWeight: 600 }}>
-                📄 {fileName}
-              </div>
-              <div style={{ fontSize: 11, color: "#166534", marginTop: 1 }}>
-                Sincronización automática activa — cada cambio se guarda en el archivo
-              </div>
-            </div>
-          ) : fileNeedsReconnect ? (
-            <div>
-              <div style={{ fontSize: 13, color: "#b45309", fontWeight: 600 }}>
-                ⚠️ {fileName}
-              </div>
-              <div style={{ fontSize: 11, color: "#92400e", marginTop: 1 }}>
-                El archivo fue vinculado antes. Haz clic en "Reconectar" para reautorizar el acceso.
-              </div>
-            </div>
-          ) : (
-            <div>
-              <div style={{ fontSize: 13, color: "var(--color-text-primary)", fontWeight: 500 }}>
-                Sin archivo vinculado
-              </div>
-              <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 1 }}>
-                Los registros se guardan solo en este navegador. Vincula un archivo .txt para portabilidad.
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* Botones de acción del archivo */}
-        <div style={{ display: "flex", gap: 8, flexShrink: 0, flexWrap: "wrap" }}>
-          {FILE_API && fileNeedsReconnect && (
-            <button
-              onClick={reconectarArchivo}
-              style={{ fontSize: 12, padding: "6px 12px", background: "#d97706", boxShadow: "none" }}
-            >
-              Reconectar
-            </button>
-          )}
-          {FILE_API && !fileLinked && !fileNeedsReconnect && (
-            <>
-              <button
-                onClick={abrirArchivo}
-                style={{ fontSize: 12, padding: "6px 12px" }}
-              >
-                Abrir archivo
-              </button>
-              <button
-                onClick={crearArchivo}
-                style={{ fontSize: 12, padding: "6px 12px", background: "var(--blue-light)", color: "var(--blue-primary)", border: "1.5px solid var(--color-border-primary)", boxShadow: "none" }}
-              >
-                Crear archivo
-              </button>
-            </>
-          )}
-          {fileLinked && (
-            <button
-              onClick={desvincularArchivo}
-              style={{ fontSize: 12, padding: "6px 12px", background: "none", color: "#dc2626", border: "1.5px solid #fca5a5", boxShadow: "none" }}
-            >
-              Desvincular
-            </button>
-          )}
         </div>
       </div>
 
@@ -442,7 +274,7 @@ export default function App() {
 
           <button
             onClick={agregar}
-            style={{ marginTop: 4, background: guardado ? "#16a34a" : "var(--blue-primary)", padding: "11px 20px", fontSize: 14, fontWeight: 600, letterSpacing: 0.3 }}
+            style={{ marginTop: 4, background: guardado ? "#16a34a" : "var(--blue-primary)", padding: "11px 20px", fontSize: 14, fontWeight: 600 }}
           >
             {guardado ? "✓ Guardado" : "Agregar lectura"}
           </button>
@@ -539,37 +371,63 @@ export default function App() {
         </div>
       )}
 
-      {/* ── Pie: exportar ── */}
-      <div style={{ marginTop: "1.75rem", paddingTop: 14, borderTop: "1.5px solid var(--color-border-tertiary)", display: "flex", gap: 10, flexWrap: "wrap" }}>
-        <button
-          onClick={() => {
-            if (!registros.length) return;
-            const csv = [
-              "Fecha,Glucosa (mg/dL),Contexto,Rango",
-              ...registros.map(r => `${fmt(r.fecha)},${r.valor},${r.contexto},${getRango(r.valor).label}`),
-            ].join("\n");
-            const a = document.createElement("a");
-            a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
-            a.download = "glucosa.csv";
-            a.click();
-          }}
-          style={{ fontSize: 13, background: "var(--blue-light)", color: "var(--blue-primary)", border: "1.5px solid var(--color-border-primary)", padding: "8px 14px", boxShadow: "none" }}
-        >
-          Exportar CSV
-        </button>
-        <button
-          onClick={() => {
-            if (!registros.length) return;
-            const txt = registros
-              .map(r => `${fmt(r.fecha)} | ${r.valor} mg/dL | ${r.contexto} | ${getRango(r.valor).label}`)
-              .join("\n");
-            navigator.clipboard.writeText(txt).then(() => alert("¡Copiado al portapapeles!"));
-          }}
-          style={{ fontSize: 13, background: "var(--blue-light)", color: "var(--blue-primary)", border: "1.5px solid var(--color-border-primary)", padding: "8px 14px", boxShadow: "none" }}
-        >
-          Copiar como texto
-        </button>
+      {/* ── Pie: archivo + exportar ── */}
+      <div style={{ marginTop: "1.75rem", paddingTop: 14, borderTop: "1.5px solid var(--color-border-tertiary)" }}>
+
+        {/* Sección de archivo */}
+        <div style={{
+          background: "#f0f7ff", border: "1.5px solid var(--color-border-tertiary)",
+          borderRadius: "var(--border-radius-md)", padding: "12px 14px",
+          marginBottom: 12,
+        }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: "var(--color-text-primary)", marginBottom: 2 }}>
+            Archivo de datos (.txt)
+          </div>
+          <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 10 }}>
+            Guarda tus registros en un archivo de texto para respaldarlos o trasladarlos a otro dispositivo.
+            Para cargar datos de una sesión anterior, importa el archivo guardado.
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button onClick={exportarTxt} style={ghostBtn}>
+              ⬇ Guardar en archivo .txt
+            </button>
+            {/* Input oculto — se activa con el botón de abajo */}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".txt,.json"
+              style={{ display: "none" }}
+              onChange={onFileSelected}
+            />
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              style={ghostBtn}
+            >
+              ⬆ Cargar desde archivo .txt
+            </button>
+          </div>
+
+          {/* Mensaje de resultado de importación */}
+          {importMsg && (
+            <div style={{
+              marginTop: 10, fontSize: 12, padding: "7px 12px",
+              borderRadius: "var(--border-radius-sm)",
+              background: importMsg.type === "ok" ? "#f0fdf4" : "#fef2f2",
+              color:      importMsg.type === "ok" ? "#15803d"  : "#dc2626",
+              border: `1px solid ${importMsg.type === "ok" ? "#86efac" : "#fca5a5"}`,
+            }}>
+              {importMsg.type === "ok" ? "✓ " : "✗ "}{importMsg.text}
+            </div>
+          )}
+        </div>
+
+        {/* Otras exportaciones */}
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button onClick={exportarCsv} style={ghostBtn}>Exportar CSV</button>
+          <button onClick={copiarTexto} style={ghostBtn}>Copiar como texto</button>
+        </div>
       </div>
+
       <div style={{ marginTop: 10, fontSize: 11, color: "var(--color-text-tertiary)" }}>
         Rangos de referencia: ADA 2024. Esta app es informativa, no reemplaza consulta médica.
       </div>
