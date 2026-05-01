@@ -3,11 +3,12 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid,
   Tooltip, ResponsiveContainer, ReferenceLine,
 } from "recharts";
+import { db } from "./db";
+import { GlucosaBST } from "./bst";
 
 // ── Constantes ────────────────────────────────────────────────────────────────
-const STORAGE_KEY = "glucosa_registros";
-const CONTEXTOS   = ["Ayunas", "Pre-comida", "Post-comida (2h)", "Antes de dormir", "Otro"];
-const TZ          = "America/El_Salvador"; // UTC-6, sin horario de verano
+const CONTEXTOS = ["Ayunas", "Pre-comida", "Post-comida (2h)", "Antes de dormir", "Otro"];
+const TZ        = "America/El_Salvador"; // UTC-6, sin horario de verano
 
 // ── Helpers de zona horaria y formato ─────────────────────────────────────────
 const getRango = (val) => {
@@ -37,57 +38,92 @@ const fmtShort = (iso) =>
 
 // ── Componente principal ──────────────────────────────────────────────────────
 export default function App() {
-  const [registros, setRegistros] = useState([]);
+  const [registros, setRegistros] = useState([]);   // array derivado del BST (para render)
   const [valor, setValor]         = useState("");
   const [ctx, setCtx]             = useState(CONTEXTOS[0]);
   const [fecha, setFecha]         = useState(nowCST);
   const [tab, setTab]             = useState("registro");
   const [guardado, setGuardado]   = useState(false);
-  const [importMsg, setImportMsg] = useState(null); // { type: "ok"|"error", text }
+  const [importMsg, setImportMsg] = useState(null);
+  const [cargando, setCargando]   = useState(true);  // mientras lee de IndexedDB
 
+  const bstRef       = useRef(new GlucosaBST());
   const timeoutRef   = useRef(null);
   const importMsgRef = useRef(null);
   const fileInputRef = useRef(null);
 
-  // ── Carga inicial desde localStorage ────────────────────────────────────────
+  // ── Inicialización: cargar desde Dexie → construir BST ───────────────────
   useEffect(() => {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) {
-      try { setRegistros(JSON.parse(saved)); } catch { /* datos corruptos, ignorar */ }
-    }
+    const init = async () => {
+      try {
+        // Leer todos los registros de IndexedDB ordenados por fecha desc
+        const lista = await db.registros.orderBy("fecha").reverse().toArray();
+
+        // Migración one-shot: si Dexie está vacío pero hay datos en localStorage
+        if (lista.length === 0) {
+          const legacy = localStorage.getItem("glucosa_registros");
+          if (legacy) {
+            const datos = JSON.parse(legacy);
+            if (datos.length > 0) {
+              await db.registros.bulkAdd(datos);
+              localStorage.removeItem("glucosa_registros");
+              bstRef.current = GlucosaBST.fromArray(datos);
+              setRegistros(bstRef.current.toArray());
+              setCargando(false);
+              return;
+            }
+          }
+        }
+
+        bstRef.current = GlucosaBST.fromArray(lista);
+        setRegistros(bstRef.current.toArray());
+      } catch (err) {
+        console.error("Error cargando datos:", err);
+      } finally {
+        setCargando(false);
+      }
+    };
+    init();
   }, []);
 
-  // ── Persistencia en localStorage ────────────────────────────────────────────
-  const guardar = (lista) => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(lista));
+  // ── Sincronizar el estado del array con el BST ────────────────────────────
+  const syncState = () => {
+    setRegistros(bstRef.current.toArray());
   };
 
   // ── CRUD ─────────────────────────────────────────────────────────────────────
-  const agregar = () => {
+  const agregar = async () => {
     const v = parseFloat(valor);
     if (!v || v < 20 || v > 600) return;
     const nuevo = { id: Date.now(), valor: v, contexto: ctx, fecha };
-    const lista = [nuevo, ...registros].sort((a, b) => parseCST(b.fecha) - parseCST(a.fecha));
-    setRegistros(lista);
-    guardar(lista);
-    setValor("");
-    setFecha(nowCST());
-    setGuardado(true);
-    clearTimeout(timeoutRef.current);
-    timeoutRef.current = setTimeout(() => setGuardado(false), 2200);
+    try {
+      await db.registros.add(nuevo);   // persiste en IndexedDB
+      bstRef.current.insert(nuevo);    // inserta en el BST en memoria
+      syncState();
+      setValor("");
+      setFecha(nowCST());
+      setGuardado(true);
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = setTimeout(() => setGuardado(false), 2200);
+    } catch (err) {
+      console.error("Error guardando registro:", err);
+    }
   };
 
-  const eliminar = (id) => {
-    const lista = registros.filter(r => r.id !== id);
-    setRegistros(lista);
-    guardar(lista);
+  const eliminar = async (id) => {
+    try {
+      await db.registros.delete(id);  // elimina de IndexedDB
+      bstRef.current.remove(id);      // elimina del BST
+      syncState();
+    } catch (err) {
+      console.error("Error eliminando registro:", err);
+    }
   };
 
-  // ── Exportar como .txt (JSON legible) ────────────────────────────────────────
+  // ── Exportar como .txt ───────────────────────────────────────────────────
   const exportarTxt = () => {
     if (!registros.length) return;
-    const contenido = JSON.stringify(registros, null, 2);
-    const blob = new Blob([contenido], { type: "text/plain;charset=utf-8" });
+    const blob = new Blob([JSON.stringify(registros, null, 2)], { type: "text/plain;charset=utf-8" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = `glucosa-${new Date().toLocaleDateString("sv-SE", { timeZone: TZ })}.txt`;
@@ -95,7 +131,7 @@ export default function App() {
     URL.revokeObjectURL(a.href);
   };
 
-  // ── Exportar como CSV ────────────────────────────────────────────────────────
+  // ── Exportar como CSV ────────────────────────────────────────────────────
   const exportarCsv = () => {
     if (!registros.length) return;
     const csv = [
@@ -109,38 +145,39 @@ export default function App() {
     URL.revokeObjectURL(a.href);
   };
 
-  // ── Importar desde .txt ──────────────────────────────────────────────────────
+  // ── Importar desde .txt ──────────────────────────────────────────────────
   const mostrarMsgImport = (type, text) => {
     setImportMsg({ type, text });
     clearTimeout(importMsgRef.current);
     importMsgRef.current = setTimeout(() => setImportMsg(null), 4000);
   };
 
-  const onFileSelected = (e) => {
+  const onFileSelected = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = (ev) => {
+    reader.onload = async (ev) => {
       try {
         const data = JSON.parse(ev.target.result);
         if (!Array.isArray(data)) throw new Error("formato inválido");
-        // Validar que cada elemento tenga los campos mínimos
         const validos = data.filter(r => r.id && r.valor != null && r.fecha);
         if (!validos.length) throw new Error("el archivo no contiene registros válidos");
-        const lista = validos.sort((a, b) => parseCST(b.fecha) - parseCST(a.fecha));
-        setRegistros(lista);
-        guardar(lista);
-        mostrarMsgImport("ok", `${lista.length} registros importados correctamente.`);
+
+        // Reemplazar todos los registros en Dexie y reconstruir el BST
+        await db.registros.clear();
+        await db.registros.bulkAdd(validos);
+        bstRef.current = GlucosaBST.fromArray(validos);
+        syncState();
+        mostrarMsgImport("ok", `${validos.length} registros importados correctamente.`);
       } catch (err) {
         mostrarMsgImport("error", `No se pudo importar: ${err.message}.`);
       }
     };
     reader.readAsText(file, "utf-8");
-    // Limpiar el input para permitir reimportar el mismo archivo
     e.target.value = "";
   };
 
-  // ── Copiar como texto ────────────────────────────────────────────────────────
+  // ── Copiar como texto ────────────────────────────────────────────────────
   const copiarTexto = () => {
     if (!registros.length) return;
     const txt = registros
@@ -149,7 +186,7 @@ export default function App() {
     navigator.clipboard.writeText(txt).then(() => alert("¡Copiado al portapapeles!"));
   };
 
-  // ── Datos derivados ──────────────────────────────────────────────────────────
+  // ── Datos derivados ──────────────────────────────────────────────────────
   const promedio  = registros.length
     ? Math.round(registros.reduce((s, r) => s + r.valor, 0) / registros.length)
     : null;
@@ -160,7 +197,7 @@ export default function App() {
     ctx:   r.contexto,
   }));
 
-  // ── Estilos de tabs ──────────────────────────────────────────────────────────
+  // ── Estilos ──────────────────────────────────────────────────────────────
   const tabStyle = (t) => ({
     padding: "9px 18px", fontSize: 13,
     fontWeight:   tab === t ? 600 : 400,
@@ -176,7 +213,15 @@ export default function App() {
     border: "1.5px solid var(--color-border-primary)", boxShadow: "none",
   };
 
-  // ── Render ───────────────────────────────────────────────────────────────────
+  // ── Render ───────────────────────────────────────────────────────────────
+  if (cargando) {
+    return (
+      <div style={{ fontFamily: "var(--font-sans)", display: "flex", alignItems: "center", justifyContent: "center", minHeight: 200, color: "var(--color-text-secondary)", fontSize: 14 }}>
+        Cargando registros…
+      </div>
+    );
+  }
+
   return (
     <div style={{ fontFamily: "var(--font-sans)" }}>
 
@@ -373,41 +418,22 @@ export default function App() {
 
       {/* ── Pie: archivo + exportar ── */}
       <div style={{ marginTop: "1.75rem", paddingTop: 14, borderTop: "1.5px solid var(--color-border-tertiary)" }}>
-
-        {/* Sección de archivo */}
         <div style={{
           background: "#f0f7ff", border: "1.5px solid var(--color-border-tertiary)",
-          borderRadius: "var(--border-radius-md)", padding: "12px 14px",
-          marginBottom: 12,
+          borderRadius: "var(--border-radius-md)", padding: "12px 14px", marginBottom: 12,
         }}>
           <div style={{ fontSize: 12, fontWeight: 600, color: "var(--color-text-primary)", marginBottom: 2 }}>
             Archivo de datos (.txt)
           </div>
           <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 10 }}>
-            Guarda tus registros en un archivo de texto para respaldarlos o trasladarlos a otro dispositivo.
-            Para cargar datos de una sesión anterior, importa el archivo guardado.
+            Exporta tus registros a un archivo de texto para respaldarlos o trasladarlos a otro dispositivo.
+            Al importar, los datos se cargan en la base de datos local.
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <button onClick={exportarTxt} style={ghostBtn}>
-              ⬇ Guardar en archivo .txt
-            </button>
-            {/* Input oculto — se activa con el botón de abajo */}
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".txt,.json"
-              style={{ display: "none" }}
-              onChange={onFileSelected}
-            />
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              style={ghostBtn}
-            >
-              ⬆ Cargar desde archivo .txt
-            </button>
+            <button onClick={exportarTxt} style={ghostBtn}>⬇ Guardar en archivo .txt</button>
+            <input ref={fileInputRef} type="file" accept=".txt,.json" style={{ display: "none" }} onChange={onFileSelected} />
+            <button onClick={() => fileInputRef.current?.click()} style={ghostBtn}>⬆ Cargar desde archivo .txt</button>
           </div>
-
-          {/* Mensaje de resultado de importación */}
           {importMsg && (
             <div style={{
               marginTop: 10, fontSize: 12, padding: "7px 12px",
@@ -420,8 +446,6 @@ export default function App() {
             </div>
           )}
         </div>
-
-        {/* Otras exportaciones */}
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           <button onClick={exportarCsv} style={ghostBtn}>Exportar CSV</button>
           <button onClick={copiarTexto} style={ghostBtn}>Copiar como texto</button>
